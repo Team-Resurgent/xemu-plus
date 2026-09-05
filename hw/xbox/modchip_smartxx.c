@@ -78,11 +78,12 @@
 #define SMARTXX_SYSCON_CLOCK_PORT \
     (SMARTXX_REGISTER_BASE + SMARTXX_REG_SYSCON_CLOCK)
 
-/* LPC ROM window. Array-mode fetches use a readonly ROM region, the same way
- * stock xbox.bios does. Writable RAM made TCG treat flash as self-modifying
- * code: visor `rep movs` from the page it was executing then sometimes
- * resumed at a garbage EIP (0x8f009). JEDEC/CHIPID still go through an
- * overlapping IO region, enabled while flash-enable is set. */
+/* LPC ROM window. Array-mode fetches come from a ROM device region's RAM
+ * tiles, so executing from flash stays fast and guest writes never touch the
+ * tiles (which would look like self-modifying code to TCG). Every write goes
+ * to the command state machine instead. Reads during a JEDEC sequence
+ * (autoselect ids) go through an overlapping IO region enabled while a
+ * command is in progress or flash-enable is set. */
 #define SMARTXX_LPC_ROM_START 0xFF000000
 #define SMARTXX_LPC_ROM_SIZE  0x01000000
 
@@ -166,10 +167,13 @@
 #define SMARTXX_FLASH_MAX_SIZE    SMARTXX_FLASH_4MB
 #define SMARTXX_TSOP_MAX_SIZE     (1024 * 1024)
 
-/* AMD-compatible parts, one per fitted size. */
-#define SMARTXX_MANUF_ID          0x01
-#define SMARTXX_DEV_ID_2MB        0xAD /* Am29F016D  */
-#define SMARTXX_DEV_ID_4MB        0x41 /* Am29F032B  */
+/* Macronix parts, one per fitted size, as the real chips answered the JEDEC
+ * autoselect on the LPC bus (0xB0/0x8A and 0xB0/0x19 on the bus, which is
+ * these values through the data-line permutation). The parts are x16 flash
+ * in byte mode, so the device id sits at A0 = 1, which is CPU offset 2. */
+#define SMARTXX_MANUF_ID          0xC2
+#define SMARTXX_DEV_ID_2MB        0x49 /* MX29LV160B */
+#define SMARTXX_DEV_ID_4MB        0xA8 /* MX29LV320B */
 
 #define SMARTXX_BANK_BOOTLOADER   0
 #define SMARTXX_BANK_FULL_4096K   0x20
@@ -787,10 +791,14 @@ static uint64_t smartxx_flash_read(void *opaque, hwaddr offset, unsigned size)
     if (s->flash_state == SMARTXX_FLASH_CHIPID) {
         uint8_t id;
 
-        switch (offset & 0x03) {
-        case 0:  id = SMARTXX_MANUF_ID; break;
-        case 1:  id = smartxx_dev_id(s); break;
-        default: id = 0; break; /* sector protect verify: nothing protected */
+        /* Offset bit 1 is the die's A0 (byte mode): 0 = manufacturer,
+         * 1 = device. A1 set = sector protect verify: nothing protected.
+         * The id bytes cross the CPLD's data-line permutation like the
+         * command bytes do, in the other direction. */
+        switch ((offset >> 1) & 0x03) {
+        case 0:  id = smartxx_unmangle_cmd(SMARTXX_MANUF_ID); break;
+        case 1:  id = smartxx_unmangle_cmd(smartxx_dev_id(s)); break;
+        default: id = 0; break;
         }
 
         SXLOG("CHIPID off=0x%06x -> 0x%02x", (uint32_t)offset, id);
@@ -1034,6 +1042,11 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case SMARTXX_REG_BANKING: {
+        /* The OS rewrites the same bank twice per step of its self-check,
+         * 49K times; rebuilding the 16 MB window each time would dominate. */
+        if ((uint8_t)val == s->bank) {
+            break;
+        }
         s->bank = val;
 
         uint32_t bk_off, bk_size;
@@ -1443,10 +1456,16 @@ static void smartxx_realize(DeviceState *dev, Error **errp)
     #define ROM_START SMARTXX_LPC_ROM_START
     #define ROM_AREA  SMARTXX_LPC_ROM_SIZE
 
-    if (!memory_region_init_rom(&s->flash_mem, OBJECT(s), "smartxx.bios",
-                                ROM_AREA, errp)) {
+    /* ROM device: array reads come straight from the RAM tiles, every write
+     * reaches the command state machine whether or not the JEDEC overlay is
+     * up. The official OS issues its autoselect twice in a row, and the
+     * second sequence used to land on a read-only region and vanish. */
+    if (!memory_region_init_rom_device(&s->flash_mem, OBJECT(s),
+                                       &smartxx_flash_ops, s, "smartxx.bios",
+                                       ROM_AREA, errp)) {
         return;
     }
+    memory_region_rom_device_set_romd(&s->flash_mem, true);
     memory_region_init_io(&s->flash_mmio, OBJECT(s), &smartxx_flash_ops, s,
                           "smartxx.flash-mmio", ROM_AREA);
     smartxx_rebuild_rom_view(s);

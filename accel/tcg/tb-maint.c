@@ -1144,10 +1144,17 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
      * XXX: see if in some cases it could be faster to invalidate all the code
      */
     PAGE_FOR_EACH_TB(start, last, p, tb, n) {
-#ifndef XBOX
         tb_page_addr_t tb_start, tb_last;
 
-        /* NOTE: this is subtle as a TB may span two physical pages */
+        /*
+         * NOTE: this is subtle as a TB may span two physical pages.
+         *
+         * xemu used to invalidate every TB on the page here regardless of
+         * overlap (703566ce33d, no rationale recorded). Guests that keep
+         * data next to code on one page then throw away and retranslate all
+         * of that page's code on every store: the SmartXX loader took four
+         * minutes to decompress its OS that way. Use the precise test.
+         */
         tb_start = tb_page_addr0(tb);
         tb_last = tb_start + tb->size - 1;
         if (n == 0) {
@@ -1157,9 +1164,6 @@ tb_invalidate_phys_page_range__locked(CPUState *cpu,
             tb_last = tb_start + (tb_last & ~TARGET_PAGE_MASK);
         }
         if (!(tb_last < start || tb_start > last)) {
-#else
-        {
-#endif
             if (unlikely(current_tb == tb) &&
                 (tb_cflags(current_tb) & CF_COUNT_MASK) != 1) {
                 /*
