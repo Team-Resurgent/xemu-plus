@@ -3093,7 +3093,10 @@ void qemu_init(int argc, char **argv)
     int modchip = (int)g_config.sys.modchip;
     if (modchip != CONFIG_SYS_MODCHIP_NONE) {
         const char *modchip_name =
-            (modchip == CONFIG_SYS_MODCHIP_XECUTER) ? "Xecuter" : "Xenium";
+            (modchip == CONFIG_SYS_MODCHIP_XECUTER)         ? "Xecuter" :
+            (modchip == CONFIG_SYS_MODCHIP_SMARTXX_OPX_2MB) ? "SmartXX OPX 2MB" :
+            (modchip == CONFIG_SYS_MODCHIP_SMARTXX_4MB)     ? "SmartXX 4MB" :
+                                                              "Xenium";
         const char *modchip_bios = g_config.sys.files.modchip_bios_path;
         bool modchip_ok =
             !check_modchip_file(modchip_name, "Modchip BIOS", modchip_bios);
@@ -3136,6 +3139,31 @@ void qemu_init(int argc, char **argv)
                     (int)g_config.sys.modchip_bank);
                 free(escaped_bios);
                 free(escaped_recovery);
+            }
+        }
+
+        if (modchip == CONFIG_SYS_MODCHIP_SMARTXX_OPX_2MB ||
+            modchip == CONFIG_SYS_MODCHIP_SMARTXX_4MB) {
+            // The OPX carries 2 MB, the classic chip 4 MB. The selected variant
+            // picks which, and the image has to match it exactly.
+            int flash_size = (modchip == CONFIG_SYS_MODCHIP_SMARTXX_OPX_2MB) ?
+                                 2 * 1024 * 1024 :
+                                 4 * 1024 * 1024;
+
+            if (check_modchip_size("Modchip BIOS", modchip_bios, flash_size)) {
+                modchip_ok = false;
+            }
+
+            if (modchip_ok) {
+                extern bool modchip_enabled;
+                modchip_enabled = true;
+
+                char *escaped_bios = strdup_double_commas(modchip_bios);
+                fake_argv[fake_argc++] = strdup("-device");
+                fake_argv[fake_argc++] = g_strdup_printf(
+                    "modchip-smartxx,rom-path=%s,flash-size=%d", escaped_bios,
+                    flash_size);
+                free(escaped_bios);
             }
         }
 

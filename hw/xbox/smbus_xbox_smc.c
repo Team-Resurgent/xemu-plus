@@ -93,6 +93,12 @@
 #define SMC_REG_INTEN               0x1a
 #define SMC_REG_SCRATCH             0x1b
 #define     SMC_REG_SCRATCH_SHORT_ANIMATION 0x04
+#define SMC_REG_CHALLENGE_0         0x1c
+#define SMC_REG_CHALLENGE_1         0x1d
+#define SMC_REG_CHALLENGE_2         0x1e
+#define SMC_REG_CHALLENGE_3         0x1f
+#define SMC_REG_RESPONSE_0          0x20
+#define SMC_REG_RESPONSE_1          0x21
 
 #define SMC_VERSION_LENGTH 3
 
@@ -151,9 +157,8 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 
     /* challenge response
      * (http://www.xbox-linux.org/wiki/PIC_Challenge_Handshake_Sequence) */
-    case 0x20:
-        break;
-    case 0x21:
+    case SMC_REG_RESPONSE_0:
+    case SMC_REG_RESPONSE_1:
         break;
 
     default:
@@ -166,50 +171,67 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 static uint8_t smc_receive_byte(SMBusDevice *dev)
 {
     SMBusSMCDevice *smc = XBOX_SMC(dev);
-    DPRINTF("smc_receive_byte: addr=0x%02x cmd=0x%02x\n",
-            dev->i2c.address, smc->cmd);
+    uint8_t cmd = smc->cmd;
+    uint8_t val = 0;
 
-    uint8_t cmd = smc->cmd++;
+    DPRINTF("smc_receive_byte: addr=0x%02x cmd=0x%02x\n",
+            dev->i2c.address, cmd);
+
+    /* Version string is the only register that auto-advances. Challenge
+     * bytes are four distinct PIC registers; PrometheOS reads each with
+     * its own BYTE_DATA cycle. */
+    if (cmd == SMC_REG_VER) {
+        smc->cmd++;
+    }
 
     switch (cmd) {
     case SMC_REG_VER:
-        return smc->version_string[
+        val = smc->version_string[
             smc->version_string_index++ % SMC_VERSION_LENGTH];
+        break;
 
     case SMC_REG_TRAYSTATE:
-        return smc->traystate_reg;
+        val = smc->traystate_reg;
+        break;
 
     case SMC_REG_SCRATCH:
-        return smc->scratch_reg;
+        val = smc->scratch_reg;
+        break;
 
     case SMC_REG_AVPACK:
-        return smc->avpack_reg;
+        val = smc->avpack_reg;
+        break;
 
     case SMC_REG_ERROR_READ:
-        return smc->error_reg;
+        val = smc->error_reg;
+        break;
 
     case SMC_REG_INTSTATUS: {
-        uint8_t r = smc->intstatus_reg;
+        val = smc->intstatus_reg;
         smc->intstatus_reg = 0; // FIXME: Confirm clear on read
-        return r;
-    }
-
-    /* challenge request:
-     * must be non-0 */
-    case 0x1c:
-        return 0x52;
-    case 0x1d:
-        return 0x72;
-    case 0x1e:
-        return 0xea;
-    case 0x1f:
-        return 0x46;
-
-    default:
         break;
     }
 
-    return 0;
+    /* challenge request: must be non-0 or 2BL power-cycles as a "debug kit" */
+    case SMC_REG_CHALLENGE_0:
+        val = 0x52;
+        break;
+    case SMC_REG_CHALLENGE_1:
+        val = 0x72;
+        break;
+    case SMC_REG_CHALLENGE_2:
+        val = 0xea;
+        break;
+    case SMC_REG_CHALLENGE_3:
+        val = 0x46;
+        break;
+
+    default:
+        val = 0;
+        break;
+    }
+
+    return val;
 }
 
 bool xbox_smc_avpack_to_reg(const char *avpack, uint8_t *value)

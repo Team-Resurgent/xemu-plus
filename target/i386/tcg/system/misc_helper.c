@@ -547,3 +547,12 @@ G_NORETURN void helper_mwait(CPUX86State *env, int next_eip_addend)
         helper_hlt(env);
     }
 }
+
+#ifdef XBOX
+void helper_xbox_cache_flush(CPUX86State *env)
+{
+    bql_lock();
+    xbox_cpu_cache_flushed();
+    bql_unlock();
+}
+#endif

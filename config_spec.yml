@@ -369,7 +369,7 @@ sys:
   # Modchip to emulate. Each modchip is loaded with the modchip BIOS below.
   modchip:
     type: enum
-    values: [none, xenium, xecuter]
+    values: [none, xenium, xecuter, smartxx_opx_2mb, smartxx_4mb]
     default: none
   # Character LCD wired to the modchip's display port. Shown in the LCD window
   # under the Debug menu.

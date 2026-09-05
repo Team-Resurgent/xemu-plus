@@ -19,6 +19,7 @@ specific_ss.add(files(
 	'xid-gamepad.c',
     'modchip_xenium.c',
 	'modchip_xecuter.c',
+	'modchip_smartxx.c',
 	'lcd_hd44780.c',
 	'lcd_xecuter.c',
 	))
