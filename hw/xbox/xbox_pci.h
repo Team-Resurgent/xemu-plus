@@ -60,6 +60,10 @@ typedef struct XBOX_LPCState {
     /* Boot ROM hidden from inside itself (Visor): the overlay stays readable,
      * as the CPU cache would, until the guest flushes it. */
     bool mcpx_rom_cached;
+
+    /* PC reset-control register at 0xCF9. */
+    MemoryRegion rcr_mem;
+    uint8_t rcr;
 } XBOX_LPCState;
 
 extern const VMStateDescription vmstate_xbox_pm;

@@ -38,6 +38,8 @@
 #include "hw/pci/pci_bridge.h"
 #include "system/address-spaces.h"
 #include "qemu/option.h"
+#include "system/runstate.h"
+#include "hw/xbox/smbus.h"
 #include "hw/xbox/acpi_xbox.h"
 #include "hw/xbox/amd_smbus.h"
 #include "hw/xbox/xbox_pci.h"
@@ -322,6 +324,46 @@ static const TypeInfo xbox_smbus_info = {
 /* The one LPC bridge, for the CPU-side cache flush notification. */
 static XBOX_LPCState *xbox_lpc;
 
+/*
+ * Reset-control register at port 0xCF9. The Xbox southbridge implements the
+ * standard PC RCR, and the retail OS reboots through it (out 0xcf9, 0x0e)
+ * rather than the SMC, both for an ordinary reboot and to launch a modchip
+ * bank. A write with bit 2 set triggers the reset; the modchip keeps its
+ * latched bank across it, as it does across any warm reset, so note the
+ * reset as warm before requesting it. A full power cycle comes through the
+ * SMC instead and stays cold, dropping the modchip back to its menu.
+ */
+#define XBOX_RCR_IOPORT 0xcf9
+
+static void xbox_rcr_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned len)
+{
+    XBOX_LPCState *d = opaque;
+
+    if (val & 4) {
+        fprintf(stderr, "[rcr] 0xCF9 write 0x%02x -> warm reset\n",
+                (unsigned)val);
+        xbox_smc_note_warm_reset();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    d->rcr = val & 2; /* keep the system-reset type bit */
+}
+
+static uint64_t xbox_rcr_read(void *opaque, hwaddr addr, unsigned len)
+{
+    XBOX_LPCState *d = opaque;
+
+    return d->rcr;
+}
+
+static const MemoryRegionOps xbox_rcr_ops = {
+    .read = xbox_rcr_read,
+    .write = xbox_rcr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+};
+
 static void xbox_lpc_realize(PCIDevice *dev, Error **errp)
 {
     XBOX_LPCState *d = XBOX_LPC_DEVICE(dev);
@@ -333,6 +375,12 @@ static void xbox_lpc_realize(PCIDevice *dev, Error **errp)
         return;
     }
     d->isa_bus = isa_bus;
+
+    memory_region_init_io(&d->rcr_mem, OBJECT(d), &xbox_rcr_ops, d,
+                          "xbox-rcr", 1);
+    memory_region_add_subregion_overlap(pci_address_space_io(dev),
+                                        XBOX_RCR_IOPORT, &d->rcr_mem, 1);
+
     xbox_lpc = d;
 }
 
