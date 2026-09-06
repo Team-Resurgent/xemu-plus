@@ -3189,6 +3189,10 @@ void qemu_init(int argc, char **argv)
         fake_argv[fake_argc++] = strdup("-device");
         fake_argv[fake_argc++] = strdup("lcd-xecuter");
         break;
+    case CONFIG_SYS_LCD_SMARTXX:
+        fake_argv[fake_argc++] = strdup("-device");
+        fake_argv[fake_argc++] = strdup("lcd-smartxx");
+        break;
     default:
         break;
     }

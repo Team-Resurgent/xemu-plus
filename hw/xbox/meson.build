@@ -22,6 +22,7 @@ specific_ss.add(files(
 	'modchip_smartxx.c',
 	'lcd_hd44780.c',
 	'lcd_xecuter.c',
+	'lcd_smartxx.c',
 	))
 subdir('nv2a')
 subdir('mcpx')

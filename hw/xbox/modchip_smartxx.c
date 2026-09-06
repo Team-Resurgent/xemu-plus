@@ -8,20 +8,31 @@
  * command addresses are bit-permuted, so a stock flasher sees a chip that
  * refuses every command.
  *
- * The CPLD XORs two physical ranges with 0xD7 on the way in and on the way
- * out: the upper 192 KB of slot 7 (0x190000-0x1BFFFF) and of the bootloader
- * (0x1D0000-0x1FFFFF), but only when they are reached through one of the wide
- * banks. Through the 256 KB bank that owns the range the die is read and
- * written raw. Both halves are measured on the LPC bus of a real chip: the
- * boot ROM and loader read the bootloader bank raw through bank 0 (and the
- * loader's signature check only passes on those bytes), while the OS's
- * self-check reads the same bytes through the full-chip bank and gets them
- * XORed. Erase leaves 0xFF on the die, which the wide banks read as 0x28.
+ * The CPLD XORs reads with 0xD7 in the upper 192 KB of the bootloader bank
+ * (0x1D0000-0x1FFFFF) and of slot 7 (0x190000-0x1BFFFF), keyed on the bank
+ * the bytes are reached through:
  *
- * Image files hold the die, so they are the backing store as they are. That
- * is also what PrometheOS stores: it reads through the full-chip bank and
- * XORs the windows back to die form, and its writeBank XORs on the way out
- * again so the CPLD lands the die bytes.
+ *   - Through the bank's own 256 KB window only its top 64 KB sector is XORed,
+ *     the 2BL area. The MCPX therefore decrypts garbage and never runs a 2BL
+ *     (the Visor wrap is the intended path), while the loader reads the OS
+ *     blob below it raw.
+ *   - Through a wide bank the two lower sectors are XORed and the top one is
+ *     not, so a full-chip dump hides the OS blob, while the OS reads and
+ *     writes its settings in that top sector as plain bytes.
+ *   - With flash-enable set every access is raw in both directions.
+ *
+ * All of it is measured on the LPC bus of real chips: bank-0 fetches of the
+ * blob equal the die and the loader's signature check only passes on those
+ * bytes; the boot ROM's bank-0 reads of the erased 2BL area return 0x28; the
+ * OS's self-check reads the blob through the full-chip bank XORed and its
+ * settings plain; with flash-enable set an erase polls raw status and ends on
+ * 0xFF and a programmed byte polls back as written; and the OS's settings
+ * save programs plain bytes and reads them back unchanged.
+ *
+ * Image files are in PrometheOS backup form: a full-chip read with the upper
+ * 192 KB of both banks XORed back. That equals the die except in the two top
+ * sectors, which the wide banks read plain, so those are stored XORed
+ * relative to the die and are converted on load and on persist.
  *
  * The official firmware leaves the 2BL area empty and boots through the Visor
  * wrap: MCPX panics, continues at RAM 0, and a far jump planted there by the
@@ -57,6 +68,10 @@
 #include "qemu/notify.h"
 #include "exec/translation-block.h"
 #include "hw/xbox/modchip_smartxx_keys.h"
+#include "hw/xbox/lcd_smartxx.h"
+
+/* smbus_xbox_smc.c: was the reset in progress requested as a warm reset? */
+bool xbox_smc_take_warm_reset(void);
 
 /* I/O register block 0xF700-0xF7FF. 0xF700-0xF704 and 0xF70D are the named
  * registers; 0xF705 is written to hand control back to the onboard TSOP.
@@ -215,7 +230,12 @@ void modchip_debug_log(const char *tag, const char *fmt, ...)
  * xcode table at offset 0x80 and running the NV2A memory init from it, so a
  * window starting at 0 mostly shows that. Bank changes are reported by the
  * flash stream regardless of this setting. */
-#define SMARTXX_DEBUG_LEVEL 0x3
+#define SMARTXX_DEBUG_LEVEL 0x2
+
+/* Diagnostic: route all reads through the IO callback (no romd fast path)
+ * and log every read/erase that touches the 0x180000-0x1FFFFF slot region,
+ * to see how the OS compares main vs backup during recovery. */
+#define SMARTXX_DIAG_SLOTS 1
 
 #define SMARTXX_READ_LOG_FIRST 0
 #define SMARTXX_READ_LOG_COUNT 4096
@@ -501,29 +521,71 @@ static uint8_t *smartxx_resolve(SmartxxState *s, hwaddr offset, uint32_t *pos)
     return smartxx_flash_raw;
 }
 
-/* Whether a physical flash offset falls in one of the two obfuscated ranges:
- * the upper 192 KB of slot 7 (bank 1, 0x180000) and of the bootloader (bank
- * 0, 0x1C0000). The addresses are fixed by the bank map, so they are the same
- * on a 2 MB part as on a 4 MB one. */
 #define SMARTXX_XOR_BYTE 0xD7
 
-static bool smartxx_is_xor_offset(uint32_t pos)
+/* The top 64 KB sector of slot 7 and of the bootloader bank: XORed through the
+ * bank's own 256 KB window, plain through a wide bank, and stored XORed in
+ * image files. The addresses are fixed by the bank map, so they are the same
+ * on a 2 MB part as on a 4 MB one. */
+static bool smartxx_is_top_sector(uint32_t pos)
 {
-    return (pos >= 0x190000 && pos < 0x1C0000) ||
-           (pos >= 0x1D0000 && pos < 0x200000);
+    return (pos >= 0x1B0000 && pos < 0x1C0000) ||
+           (pos >= 0x1F0000 && pos < 0x200000);
 }
 
-/* The XOR applies through the wide banks only; the 256 KB banks that own the
- * two ranges see the die raw. Same in both directions. */
+/* The two sectors below it: plain through the bank's own window, XORed
+ * through a wide bank. */
+static bool smartxx_is_blob_sector(uint32_t pos)
+{
+    return (pos >= 0x190000 && pos < 0x1B0000) ||
+           (pos >= 0x1D0000 && pos < 0x1F0000);
+}
+
+/* What the CPLD does to a byte between the die and the bus for the selected
+ * bank. Nothing at all while flash-enable is set: software programs and
+ * verifies the die directly in that mode. */
 static uint8_t smartxx_cpld_xor(SmartxxState *s, uint32_t pos, uint8_t byte)
 {
     uint32_t bk_off, bk_size;
+    bool xor;
 
-    if (s->tsop || !smartxx_is_xor_offset(pos)) {
+    /* What the CPLD does to a byte between the die and the bus for the selected
+     * bank. Nothing at all while flash-enable is set: software programs and
+     * verifies the die directly in that mode. */
+    if (s->tsop || s->flash_enable) {
         return byte;
     }
     smartxx_bank_decode(s, s->bank, &bk_off, &bk_size);
-    return bk_size > 0x40000 ? byte ^ SMARTXX_XOR_BYTE : byte;
+    if (bk_size > 0x40000) {
+        /* Through the full-chip bank the OS compares the main slot against the
+         * backup to decide whether the backup needs rebuilding. The two slots
+         * hold the same OS but their dies differ by the XOR byte: the main
+         * slot is stored plain and the backup already XORed. So the full-chip
+         * view XORs the main slot's OS blob and reads the backup's plain, and
+         * both come out as the same bytes. (On classic both blobs are XORed
+         * through this bank, which is what its self-check expects.) */
+        if (smartxx_is_opx(s)) {
+            xor = (pos >= 0x1D0000 && pos < 0x1F0000);
+        } else {
+            xor = smartxx_is_blob_sector(pos);
+        }
+    } else {
+        xor = smartxx_is_top_sector(pos);
+    }
+    return xor ? byte ^ SMARTXX_XOR_BYTE : byte;
+}
+
+/* Convert between an image file and the die: only the two top sectors
+ * differ. The XOR is its own inverse, so one routine serves both ways. */
+static void smartxx_convert_image(uint8_t *chip, uint32_t size)
+{
+    uint32_t i;
+
+    for (i = 0; i < size; i++) {
+        if (smartxx_is_top_sector(i)) {
+            chip[i] ^= SMARTXX_XOR_BYTE;
+        }
+    }
 }
 
 static uint32_t smartxx_rom_window_size(SmartxxState *s)
@@ -683,7 +745,11 @@ static void smartxx_flash_flush(SmartxxState *s)
         return;
     }
 
-    ssize_t written = write(fd, smartxx_flash_raw, s->flash_size);
+    /* The file keeps the image form, so convert a copy of the die. */
+    uint8_t *image = g_memdup2(smartxx_flash_raw, s->flash_size);
+    smartxx_convert_image(image, s->flash_size);
+    ssize_t written = write(fd, image, s->flash_size);
+    g_free(image);
     close(fd);
 
     if (written != (ssize_t)s->flash_size) {
@@ -765,8 +831,14 @@ static void smartxx_erase_sector(SmartxxState *s, hwaddr offset)
         sector_size = s->flash_size - base;
     }
 
-    SXLOG("ERASE  sector base=0x%06x size=%uK (target 0x%06x)", base,
-          sector_size / 1024, pos);
+    {
+        uint32_t bo, bs;
+        smartxx_bank_decode(s, s->bank, &bo, &bs);
+        SXLOG("ERASE  sector base=0x%06x size=%uK (target 0x%06x) "
+              "from off=0x%06x bank=0x%02x win=%uK fe=%d", base,
+              sector_size / 1024, pos, (uint32_t)offset, s->bank, bs / 1024,
+              s->flash_enable);
+    }
     memset(&chip[base], 0xFF, sector_size);
     smartxx_flash_mark_dirty(s);
     smartxx_rebuild_rom_view(s);
@@ -826,6 +898,30 @@ static uint64_t smartxx_flash_read(void *opaque, hwaddr offset, unsigned size)
         val |= (uint64_t)byte << (i * 8);
     }
 
+#if SMARTXX_DIAG_SLOTS
+    if (is_flash && pos >= 0x180000 && pos < 0x200000 &&
+        (s->bank == 0x20 || pos < 0x1C0000)) {
+        /* One line per 64 KB sector per bank: the first byte and the bank it
+         * was read through is enough to see how the OS compares main vs
+         * backup, without drowning the log in every byte. */
+        static uint32_t seen[1024];
+        static unsigned nseen;
+        uint32_t key = ((uint32_t)s->bank << 24) | (pos >> 16);
+        bool logged = false;
+        for (unsigned k = 0; k < nseen; k++) {
+            if (seen[k] == key) { logged = true; break; }
+        }
+        if (!logged && nseen < 1024) {
+            uint32_t bo, bs;
+            seen[nseen++] = key;
+            smartxx_bank_decode(s, s->bank, &bo, &bs);
+            modchip_debug_log("smartxx-cmp",
+                "READ sector 0x%06x first-byte 0x%02x via bank=0x%02x win=%uK "
+                "fe=%d (off=0x%06x)", pos & 0xFF0000, (uint8_t)(val & 0xFF),
+                s->bank, bs / 1024, s->flash_enable, (uint32_t)offset);
+        }
+    }
+#endif
     s->read_count++;
 
     /* The first fetch from a newly selected bank is worth a line of its own: it
@@ -993,8 +1089,11 @@ static void smartxx_flash_write(void *opaque, hwaddr offset, uint64_t value,
                 chip[at] = smartxx_cpld_xor(s, at, byte);
             }
             smartxx_flash_mark_dirty(s);
+            /* Only the programmed bytes change; the OS programs its
+             * settings one byte at a time, so a full 16 MB rebuild per
+             * byte would take minutes. */
+            smartxx_patch_rom_view(s, offset, value, size);
         }
-        smartxx_rebuild_rom_view(s);
         smartxx_flash_enter_idle(s);
         break;
     }
@@ -1042,6 +1141,15 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case SMARTXX_REG_BANKING: {
+#if SMARTXX_DIAG_SLOTS
+        {
+            uint32_t bo, bs;
+            smartxx_bank_decode(s, (uint8_t)val, &bo, &bs);
+            modchip_debug_log("smartxx-cmp",
+                "BANKSEL write 0x%02x -> off=0x%06x win=%uK%s", (uint8_t)val,
+                bo, bs / 1024, ((uint8_t)val == s->bank) ? " (same)" : "");
+        }
+#endif
         /* The OS rewrites the same bank twice per step of its self-check,
          * 49K times; rebuilding the 16 MB window each time would dominate. */
         if ((uint8_t)val == s->bank) {
@@ -1049,6 +1157,13 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
         }
         s->bank = val;
 
+#if SMARTXX_DIAG_SLOTS
+        /* While the full-chip bank is selected the OS runs from RAM and only
+         * reads flash as data, so drop romd to route those reads through the
+         * logger; restore it for the execution banks. */
+        memory_region_rom_device_set_romd(&s->flash_mem,
+                                          (uint8_t)val != 0x20);
+#endif
         uint32_t bk_off, bk_size;
         if (smartxx_bank_decode(s, s->bank, &bk_off, &bk_size)) {
             SXLOG("IO write BANK=0x%02x (%u) -> off=0x%06x win=%uK%s", s->bank,
@@ -1063,13 +1178,21 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
         smartxx_rebuild_rom_view(s);
         break;
     }
-    case SMARTXX_REG_FLASH_ENABLE:
-        s->flash_enable = (val & 1) != 0;
-        smartxx_set_flash_mmio(s, s->flash_enable);
-        if (!s->flash_enable) {
+    case SMARTXX_REG_FLASH_ENABLE: {
+        bool enable = (val & 1) != 0;
+#if SMARTXX_DIAG_SLOTS
+        modchip_debug_log("smartxx-cmp", "FLASH_ENABLE write 0x%02x -> %d",
+                          (uint8_t)val, enable);
+#endif
+
+        /* Flash-enable switches the CPLD between the obfuscated view and the
+         * raw die, so the window has to be rebuilt on every change. */
+        if (enable != s->flash_enable) {
+            s->flash_enable = enable;
             smartxx_rebuild_rom_view(s);
         }
         break;
+    }
     case SMARTXX_REG_TSOP:
         /* Hand the bus to the motherboard flash. The guest reboots straight
          * after, so there is nothing to do but remember it. */
@@ -1081,8 +1204,16 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
         }
         break;
     case SMARTXX_REG_ID:
-        /* Reads are the chip id, writes are the LCD backlight. */
+        /* Reads are the chip id, writes are the LCD backlight. The official
+         * OS sizes the register by the id's low nibble: 1 and 2 (V1, V2; our
+         * classic id is 0xF1) get six bits and a menu capped at 63, 5 (OPX)
+         * and 8 (V3) get seven. Scale so full is full on the panel. */
         s->backlight = val;
+        if (smartxx_is_opx(s)) {
+            lcd_smartxx_backlight_write(val & 0x7F);
+        } else {
+            lcd_smartxx_backlight_write((val & 0x3F) * 127 / 63);
+        }
         break;
     case SMARTXX_REG_DISP:
         s->disp = val;
@@ -1102,7 +1233,8 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
                                               : SMARTXX_SYSCON_CLS_RESP1;
             uint8_t want2 = smartxx_is_opx(s) ? SMARTXX_SYSCON_OPX_RESP2
                                               : SMARTXX_SYSCON_CLS_RESP2;
-            bool ok = (s->syscon_resp1 == want1 && s->syscon_resp2 == want2);
+            G_GNUC_UNUSED bool ok =
+                (s->syscon_resp1 == want1 && s->syscon_resp2 == want2);
 
             SXLOG("SYSCON response 0x%02x/0x%02x after %u dwords - %s "
                   "(expected 0x%02x/0x%02x for a %s)",
@@ -1406,6 +1538,7 @@ static void smartxx_realize(DeviceState *dev, Error **errp)
                             errp)) {
         return;
     }
+    smartxx_convert_image(smartxx_flash_raw, s->flash_size);
     s->syscon_stream = smartxx_is_opx(s) ? smartxx_key_stream_opx
                                          : smartxx_key_stream_classic;
     s->syscon_stream_len = SMARTXX_KEY_STREAM_LENGTH;
@@ -1498,7 +1631,7 @@ static void smartxx_realize(DeviceState *dev, Error **errp)
         uint8_t byte = chip ? chip[pos] : 0xFF;
 
         /* This page is the top of the bootloader bank, read through bank 0,
-         * which sees the die raw; the helper knows that. */
+         * whose top sector the CPLD XORs; the helper knows that. */
         if (chip == smartxx_flash_raw) {
             byte = smartxx_cpld_xor(s, pos, byte);
         }
@@ -1532,6 +1665,39 @@ static void smartxx_realize(DeviceState *dev, Error **errp)
           s->syscon_stream_len);
 }
 
+/*
+ * The bank register is what the OS uses to boot a slot: it selects the bank
+ * and asks the SMC for a warm reset, so the CPLD must keep it across LRESET#.
+ * A power cycle comes up on the bootloader bank. A reset from the host UI is
+ * treated as a power cycle: a real console has no reset button, and the OS
+ * idles with the full-chip bank selected, which would boot garbage.
+ */
+static void smartxx_reset(DeviceState *dev)
+{
+    SmartxxState *s = SMARTXX_DEVICE(dev);
+    bool warm = xbox_smc_take_warm_reset();
+
+    if (!warm) {
+        s->bank = SMARTXX_BANK_BOOTLOADER;
+        s->tsop = false;
+    }
+    s->flash_enable = false;
+    s->flash_state = SMARTXX_FLASH_IDLE;
+    s->syscon_active = false;
+    s->syscon_clocks = 0;
+    s->syscon_latch = 0;
+    s->syscon_resp1 = 0;
+    s->syscon_resp2 = 0;
+    s->syscon_stream_overrun = false;
+    s->read_log_key = 0xFFFFFFFF;
+    if (s->rom_mapped) {
+        smartxx_set_flash_mmio(s, false);
+        smartxx_rebuild_rom_view(s);
+    }
+    SXLOG("RESET  %s, bank=%u tsop=%d", warm ? "warm (bank kept)" :
+          "cold (bootloader bank)", s->bank, s->tsop);
+}
+
 static const Property smartxx_properties[] = {
     DEFINE_PROP_STRING("rom-path", SmartxxState, rom_file),
     DEFINE_PROP_UINT32("flash-size", SmartxxState, flash_size,
@@ -1553,6 +1719,7 @@ static void smartxx_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "SmartXX modchip";
     dc->realize = smartxx_realize;
+    device_class_set_legacy_reset(dc, smartxx_reset);
     dc->vmsd = &vmstate_smartxx;
     device_class_set_props(dc, smartxx_properties);
 }

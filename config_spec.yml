@@ -375,7 +375,7 @@ sys:
   # under the Debug menu.
   lcd:
     type: enum
-    values: [none, xecuter]
+    values: [none, xecuter, smartxx]
     default: none
   # Xecuter only: value of the four bank-select switches, which choose the
   # active bank until the guest enables soft control.

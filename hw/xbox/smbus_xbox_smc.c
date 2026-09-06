@@ -119,6 +119,21 @@ static void smc_quick_cmd(SMBusDevice *dev, uint8_t read)
     DPRINTF("smc_quick_cmd: addr=0x%02x read=%d\n", dev->i2c.address, read);
 }
 
+static bool xbox_smc_warm_reset;
+
+void xbox_smc_note_warm_reset(void)
+{
+    xbox_smc_warm_reset = true;
+}
+
+bool xbox_smc_take_warm_reset(void)
+{
+    bool warm = xbox_smc_warm_reset;
+
+    xbox_smc_warm_reset = false;
+    return warm;
+}
+
 static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 {
     SMBusSMCDevice *smc = XBOX_SMC(dev);
@@ -140,7 +155,12 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_POWER:
+        fprintf(stderr, "[smc] POWER write 0x%02x (%s)\n", buf[0],
+                (buf[0] & SMC_REG_POWER_CYCLE) ? "cycle/cold" :
+                (buf[0] & SMC_REG_POWER_RESET) ? "reset/warm" :
+                (buf[0] & SMC_REG_POWER_SHUTDOWN) ? "shutdown" : "?");
         if (buf[0] & (SMC_REG_POWER_RESET | SMC_REG_POWER_CYCLE)) {
+            xbox_smc_warm_reset = !(buf[0] & SMC_REG_POWER_CYCLE);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         } else if (buf[0] & SMC_REG_POWER_SHUTDOWN) {
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);

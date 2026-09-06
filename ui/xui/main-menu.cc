@@ -1809,7 +1809,8 @@ void MainMenuSystemView::Draw()
     SectionTitle("Display");
     if (ChevronCombo("LCD", &g_config.sys.lcd,
                      "None (Default)\0"
-                     "Xecuter\0",
+                     "Xecuter\0"
+                     "SmartXX\0",
                      "Attach a character LCD, shown in the Debug LCD window")) {
         m_dirty = true;
     }

@@ -991,6 +991,11 @@ static void nvnet_reset(void *opaque)
 
     memset(&s->regs, 0, sizeof(s->regs));
     or_reg(s, NVNET_TX_RX_CONTROL, NVNET_TX_RX_CONTROL_IDLE);
+    /* The MII clock divider must reset non-zero: the SmartXX OS derives its
+     * MDIO poll timeout from it and never programs it, so a zero here makes
+     * every PHY access after its NIC init fail before it polls. Use what
+     * forcedeth programs. */
+    set_reg(s, NVNET_MII_SPEED, NVNET_MII_SPEED_BIT8 | NVNET_MII_SPEED_DELAY);
 
     reset_phy_regs(s);
     memset(&s->tx_dma_buf, 0, sizeof(s->tx_dma_buf));
