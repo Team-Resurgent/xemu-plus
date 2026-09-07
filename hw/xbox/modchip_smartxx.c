@@ -230,12 +230,7 @@ void modchip_debug_log(const char *tag, const char *fmt, ...)
  * xcode table at offset 0x80 and running the NV2A memory init from it, so a
  * window starting at 0 mostly shows that. Bank changes are reported by the
  * flash stream regardless of this setting. */
-#define SMARTXX_DEBUG_LEVEL 0x2
-
-/* Diagnostic: route all reads through the IO callback (no romd fast path)
- * and log every read/erase that touches the 0x180000-0x1FFFFF slot region,
- * to see how the OS compares main vs backup during recovery. */
-#define SMARTXX_DIAG_SLOTS 1
+#define SMARTXX_DEBUG_LEVEL 0x0
 
 #define SMARTXX_READ_LOG_FIRST 0
 #define SMARTXX_READ_LOG_COUNT 4096
@@ -533,14 +528,6 @@ static bool smartxx_is_top_sector(uint32_t pos)
            (pos >= 0x1F0000 && pos < 0x200000);
 }
 
-/* The two sectors below it: plain through the bank's own window, XORed
- * through a wide bank. */
-static bool smartxx_is_blob_sector(uint32_t pos)
-{
-    return (pos >= 0x190000 && pos < 0x1B0000) ||
-           (pos >= 0x1D0000 && pos < 0x1F0000);
-}
-
 /* What the CPLD does to a byte between the die and the bus for the selected
  * bank. Nothing at all while flash-enable is set: software programs and
  * verifies the die directly in that mode. */
@@ -557,18 +544,16 @@ static uint8_t smartxx_cpld_xor(SmartxxState *s, uint32_t pos, uint8_t byte)
     }
     smartxx_bank_decode(s, s->bank, &bk_off, &bk_size);
     if (bk_size > 0x40000) {
-        /* Through the full-chip bank the OS compares the main slot against the
-         * backup to decide whether the backup needs rebuilding. The two slots
-         * hold the same OS but their dies differ by the XOR byte: the main
-         * slot is stored plain and the backup already XORed. So the full-chip
-         * view XORs the main slot's OS blob and reads the backup's plain, and
-         * both come out as the same bytes. (On classic both blobs are XORed
-         * through this bank, which is what its self-check expects.) */
-        if (smartxx_is_opx(s)) {
-            xor = (pos >= 0x1D0000 && pos < 0x1F0000);
-        } else {
-            xor = smartxx_is_blob_sector(pos);
-        }
+        /* Through any full-chip bank (OPX 2 MB or classic 4 MB, keyed on the
+         * window size not the bank id) the OS compares the main slot against
+         * the backup to decide whether the backup needs rebuilding. The
+         * recovery reads main through this bank (XORed) and writes it raw, so
+         * the rebuilt backup die is main ^ 0xD7. For the compare to see the
+         * two slots as equal, the full-chip view XORs the main slot's OS blob
+         * (0x1D0000-0x1EFFFF) and reads the backup slot's plain; both then
+         * come out as the same bytes. The main blob is XORed here either way,
+         * so classic's boot and self-check are unchanged. */
+        xor = (pos >= 0x1D0000 && pos < 0x1F0000);
     } else {
         xor = smartxx_is_top_sector(pos);
     }
@@ -831,14 +816,8 @@ static void smartxx_erase_sector(SmartxxState *s, hwaddr offset)
         sector_size = s->flash_size - base;
     }
 
-    {
-        uint32_t bo, bs;
-        smartxx_bank_decode(s, s->bank, &bo, &bs);
-        SXLOG("ERASE  sector base=0x%06x size=%uK (target 0x%06x) "
-              "from off=0x%06x bank=0x%02x win=%uK fe=%d", base,
-              sector_size / 1024, pos, (uint32_t)offset, s->bank, bs / 1024,
-              s->flash_enable);
-    }
+    SXLOG("ERASE  sector base=0x%06x size=%uK (target 0x%06x)", base,
+          sector_size / 1024, pos);
     memset(&chip[base], 0xFF, sector_size);
     smartxx_flash_mark_dirty(s);
     smartxx_rebuild_rom_view(s);
@@ -898,30 +877,6 @@ static uint64_t smartxx_flash_read(void *opaque, hwaddr offset, unsigned size)
         val |= (uint64_t)byte << (i * 8);
     }
 
-#if SMARTXX_DIAG_SLOTS
-    if (is_flash && pos >= 0x180000 && pos < 0x200000 &&
-        (s->bank == 0x20 || pos < 0x1C0000)) {
-        /* One line per 64 KB sector per bank: the first byte and the bank it
-         * was read through is enough to see how the OS compares main vs
-         * backup, without drowning the log in every byte. */
-        static uint32_t seen[1024];
-        static unsigned nseen;
-        uint32_t key = ((uint32_t)s->bank << 24) | (pos >> 16);
-        bool logged = false;
-        for (unsigned k = 0; k < nseen; k++) {
-            if (seen[k] == key) { logged = true; break; }
-        }
-        if (!logged && nseen < 1024) {
-            uint32_t bo, bs;
-            seen[nseen++] = key;
-            smartxx_bank_decode(s, s->bank, &bo, &bs);
-            modchip_debug_log("smartxx-cmp",
-                "READ sector 0x%06x first-byte 0x%02x via bank=0x%02x win=%uK "
-                "fe=%d (off=0x%06x)", pos & 0xFF0000, (uint8_t)(val & 0xFF),
-                s->bank, bs / 1024, s->flash_enable, (uint32_t)offset);
-        }
-    }
-#endif
     s->read_count++;
 
     /* The first fetch from a newly selected bank is worth a line of its own: it
@@ -1141,15 +1096,6 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case SMARTXX_REG_BANKING: {
-#if SMARTXX_DIAG_SLOTS
-        {
-            uint32_t bo, bs;
-            smartxx_bank_decode(s, (uint8_t)val, &bo, &bs);
-            modchip_debug_log("smartxx-cmp",
-                "BANKSEL write 0x%02x -> off=0x%06x win=%uK%s", (uint8_t)val,
-                bo, bs / 1024, ((uint8_t)val == s->bank) ? " (same)" : "");
-        }
-#endif
         /* The OS rewrites the same bank twice per step of its self-check,
          * 49K times; rebuilding the 16 MB window each time would dominate. */
         if ((uint8_t)val == s->bank) {
@@ -1157,13 +1103,6 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
         }
         s->bank = val;
 
-#if SMARTXX_DIAG_SLOTS
-        /* While the full-chip bank is selected the OS runs from RAM and only
-         * reads flash as data, so drop romd to route those reads through the
-         * logger; restore it for the execution banks. */
-        memory_region_rom_device_set_romd(&s->flash_mem,
-                                          (uint8_t)val != 0x20);
-#endif
         uint32_t bk_off, bk_size;
         if (smartxx_bank_decode(s, s->bank, &bk_off, &bk_size)) {
             SXLOG("IO write BANK=0x%02x (%u) -> off=0x%06x win=%uK%s", s->bank,
@@ -1180,10 +1119,6 @@ static void smartxx_io_write(void *opaque, hwaddr addr, uint64_t val,
     }
     case SMARTXX_REG_FLASH_ENABLE: {
         bool enable = (val & 1) != 0;
-#if SMARTXX_DIAG_SLOTS
-        modchip_debug_log("smartxx-cmp", "FLASH_ENABLE write 0x%02x -> %d",
-                          (uint8_t)val, enable);
-#endif
 
         /* Flash-enable switches the CPLD between the obfuscated view and the
          * raw die, so the window has to be rebuilt on every change. */

@@ -341,8 +341,6 @@ static void xbox_rcr_write(void *opaque, hwaddr addr, uint64_t val,
     XBOX_LPCState *d = opaque;
 
     if (val & 4) {
-        fprintf(stderr, "[rcr] 0xCF9 write 0x%02x -> warm reset\n",
-                (unsigned)val);
         xbox_smc_note_warm_reset();
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         return;

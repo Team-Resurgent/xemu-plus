@@ -155,10 +155,6 @@ static int smc_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
         break;
 
     case SMC_REG_POWER:
-        fprintf(stderr, "[smc] POWER write 0x%02x (%s)\n", buf[0],
-                (buf[0] & SMC_REG_POWER_CYCLE) ? "cycle/cold" :
-                (buf[0] & SMC_REG_POWER_RESET) ? "reset/warm" :
-                (buf[0] & SMC_REG_POWER_SHUTDOWN) ? "shutdown" : "?");
         if (buf[0] & (SMC_REG_POWER_RESET | SMC_REG_POWER_CYCLE)) {
             xbox_smc_warm_reset = !(buf[0] & SMC_REG_POWER_CYCLE);
             qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
