@@ -421,6 +421,19 @@ static bool xbox_lpc_cpu_in_mcpx_rom(XBOX_LPCState *s)
     }
 
     env = &X86_CPU(cs)->env;
+
+    /*
+     * The Visor cache retention only makes sense while the CPU cache is
+     * actually on: it is the cache that holds the ROM lines across the hide.
+     * The MCPX ROM enables the cache (clears CR0.CD/NW) before its bad-2BL
+     * panic, so the panic hide runs with the cache on. An earlier hide with
+     * the cache still disabled (CR0.CD/NW set, as the Xecuter boot does)
+     * takes the ROM away at once, exactly as it did before this model.
+     */
+    if (env->cr[0] & (CR0_CD_MASK | CR0_NW_MASK)) {
+        return false;
+    }
+
     linear = (uint32_t)env->segs[R_CS].base + (uint32_t)env->eip;
     if (env->cr[0] & CR0_PG_MASK) {
         phys = cpu_get_phys_page_debug(cs, linear & TARGET_PAGE_MASK);
