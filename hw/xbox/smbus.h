@@ -35,6 +35,15 @@ bool xbox_smc_avpack_to_reg(const char *avpack, uint8_t *value);
 void xbox_smc_append_avpack_hint(Error **errp);
 void xbox_smc_append_smc_version_hint(Error **errp);
 void xbox_smc_power_button(void);
+/* Whether the reset now in progress was requested by the guest as a warm
+ * reset (SMC POWER 0x01) rather than a power cycle or a host reset. Clears
+ * the note. Devices whose state survives a warm reset on real hardware,
+ * like a modchip's bank register, consult it from their reset handler. */
+bool xbox_smc_take_warm_reset(void);
+/* Note that the reset now being requested is a warm one, so the next
+ * xbox_smc_take_warm_reset() reports it. The 0xCF9 reset-control path uses
+ * this: the OS reboots into a modchip bank through 0xCF9, not the SMC. */
+void xbox_smc_note_warm_reset(void);
 void xbox_smc_eject_button(void);
 void xbox_smc_update_tray_state(void);
 

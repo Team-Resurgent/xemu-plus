@@ -1754,7 +1754,9 @@ void MainMenuSystemView::Draw()
     if (ChevronCombo("Modchip", &g_config.sys.modchip,
                      "None (Default)\0"
                      "Xenium\0"
-                     "Xecuter\0",
+                     "Xecuter\0"
+                     "SmartXX OPX 2MB\0"
+                     "SmartXX 4MB\0",
                      "Select a modchip to emulate")) {
         m_dirty = true;
     }
@@ -1807,7 +1809,8 @@ void MainMenuSystemView::Draw()
     SectionTitle("Display");
     if (ChevronCombo("LCD", &g_config.sys.lcd,
                      "None (Default)\0"
-                     "Xecuter\0",
+                     "Xecuter\0"
+                     "SmartXX\0",
                      "Attach a character LCD, shown in the Debug LCD window")) {
         m_dirty = true;
     }

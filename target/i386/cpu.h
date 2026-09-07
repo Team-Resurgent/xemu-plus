@@ -2728,6 +2728,12 @@ static inline int32_t x86_get_a20_mask(CPUX86State *env)
     }
 }
 
+#ifdef XBOX
+/* WBINVD/INVD executed by the guest. The LPC bridge models the boot ROM
+ * lines the cache held (hw/xbox/xbox_pci.c). */
+void xbox_cpu_cache_flushed(void);
+#endif
+
 static inline uint32_t x86_cpu_family(uint32_t eax)
 {
     uint32_t family = (eax >> 8) & 0xf;

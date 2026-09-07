@@ -1622,6 +1622,14 @@ static void gen_CLI(DisasContext *s, X86DecodedInsn *decode)
     gen_reset_eflags(s, IF_MASK);
 }
 
+#if defined(XBOX) && !defined(CONFIG_USER_ONLY)
+static void gen_CACHE_FLUSH(DisasContext *s, X86DecodedInsn *decode)
+{
+    /* WBINVD/INVD: the Xbox boot ROM overlay follows the cache. */
+    gen_helper_xbox_cache_flush(tcg_env);
+}
+#endif
+
 static void gen_CLTS(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_helper_clts(tcg_env);

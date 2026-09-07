@@ -184,17 +184,12 @@ void amd756_smb_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
             }
         }
 
-        if (val & GS_CLEAR_STS) {
-            s->smb_stat = 0;
-            s->smb_index = 0;
-        } else if (val & GS_HCYC_STS) {
-            s->smb_stat = GS_HCYC_STS;
-            s->smb_index = 0;
-        } else {
-            s->smb_stat = GS_HCYC_STS;
-            s->smb_index = 0;
-        }
-
+        /* Write-1-to-clear. Writing 0 is a no-op. */
+        s->smb_stat &= ~(val & 0xff);
+        s->smb_index = 0;
+        break;
+    case SMB_GLOBAL_STATUS + 1:
+        s->smb_stat &= ~((uint16_t)(val & 0xff) << 8);
         break;
     case SMB_GLOBAL_ENABLE:
         s->smb_ctl = val;
@@ -244,7 +239,10 @@ uint32_t amd756_smb_ioport_readb(void *opaque, uint32_t addr)
 
     switch (addr) {
     case SMB_GLOBAL_STATUS:
-        val = s->smb_stat;
+        val = s->smb_stat & 0xff;
+        break;
+    case SMB_GLOBAL_STATUS + 1:
+        val = (s->smb_stat >> 8) & 0xff;
         break;
     case SMB_GLOBAL_ENABLE:
         // s->smb_index = 0;

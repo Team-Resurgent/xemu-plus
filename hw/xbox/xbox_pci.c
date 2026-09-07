@@ -38,10 +38,15 @@
 #include "hw/pci/pci_bridge.h"
 #include "system/address-spaces.h"
 #include "qemu/option.h"
+#include "system/runstate.h"
+#include "hw/xbox/smbus.h"
 #include "hw/xbox/acpi_xbox.h"
 #include "hw/xbox/amd_smbus.h"
 #include "hw/xbox/xbox_pci.h"
 #include "hw/irq.h"
+#include "hw/core/cpu.h"
+#include "exec/target_page.h"
+#include "cpu.h"
 #include "migration/vmstate.h"
 
  /*
@@ -316,6 +321,47 @@ static const TypeInfo xbox_smbus_info = {
     },
 };
 
+/* The one LPC bridge, for the CPU-side cache flush notification. */
+static XBOX_LPCState *xbox_lpc;
+
+/*
+ * Reset-control register at port 0xCF9. The Xbox southbridge implements the
+ * standard PC RCR, and the retail OS reboots through it (out 0xcf9, 0x0e)
+ * rather than the SMC, both for an ordinary reboot and to launch a modchip
+ * bank. A write with bit 2 set triggers the reset; the modchip keeps its
+ * latched bank across it, as it does across any warm reset, so note the
+ * reset as warm before requesting it. A full power cycle comes through the
+ * SMC instead and stays cold, dropping the modchip back to its menu.
+ */
+#define XBOX_RCR_IOPORT 0xcf9
+
+static void xbox_rcr_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned len)
+{
+    XBOX_LPCState *d = opaque;
+
+    if (val & 4) {
+        xbox_smc_note_warm_reset();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
+    d->rcr = val & 2; /* keep the system-reset type bit */
+}
+
+static uint64_t xbox_rcr_read(void *opaque, hwaddr addr, unsigned len)
+{
+    XBOX_LPCState *d = opaque;
+
+    return d->rcr;
+}
+
+static const MemoryRegionOps xbox_rcr_ops = {
+    .read = xbox_rcr_read,
+    .write = xbox_rcr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = { .min_access_size = 1, .max_access_size = 1 },
+};
+
 static void xbox_lpc_realize(PCIDevice *dev, Error **errp)
 {
     XBOX_LPCState *d = XBOX_LPC_DEVICE(dev);
@@ -327,23 +373,123 @@ static void xbox_lpc_realize(PCIDevice *dev, Error **errp)
         return;
     }
     d->isa_bus = isa_bus;
+
+    memory_region_init_io(&d->rcr_mem, OBJECT(d), &xbox_rcr_ops, d,
+                          "xbox-rcr", 1);
+    memory_region_add_subregion_overlap(pci_address_space_io(dev),
+                                        XBOX_RCR_IOPORT, &d->rcr_mem, 1);
+
+    xbox_lpc = d;
 }
 
-static void xbox_lpc_enable_mcpx_rom(PCIDevice *dev, bool enable) {
-    XBOX_LPCState *s = XBOX_LPC_DEVICE(dev);
+static MemoryRegion *xbox_lpc_mcpx_rom(XBOX_LPCState *s)
+{
     MemoryRegion *subregion;
     QTAILQ_FOREACH(subregion, &s->rom_memory->subregions, subregions_link) {
         if (subregion->name != NULL && strcmp(subregion->name, "xbox.mcpx") == 0) {
-            memory_region_set_enabled(subregion, enable);
-            break;
+            return subregion;
         }
+    }
+    return NULL;
+}
+
+static void xbox_lpc_enable_mcpx_rom(XBOX_LPCState *s, bool enable)
+{
+    MemoryRegion *mcpx = xbox_lpc_mcpx_rom(s);
+    if (mcpx != NULL) {
+        memory_region_set_enabled(mcpx, enable);
+    }
+}
+
+/*
+ * Whether the CPU writing the config register is executing from the boot ROM
+ * overlay itself. env->eip is only exact at the start of a TB, but a TB never
+ * crosses a page and the overlay is page aligned, so the page is right.
+ */
+static bool xbox_lpc_cpu_in_mcpx_rom(XBOX_LPCState *s)
+{
+    CPUState *cs = current_cpu;
+    CPUX86State *env;
+    MemoryRegion *mcpx = xbox_lpc_mcpx_rom(s);
+    MemoryRegionSection section;
+    hwaddr phys;
+    uint32_t linear;
+    bool in_rom;
+
+    if (cs == NULL || mcpx == NULL) {
+        return false;
+    }
+
+    env = &X86_CPU(cs)->env;
+    linear = (uint32_t)env->segs[R_CS].base + (uint32_t)env->eip;
+    if (env->cr[0] & CR0_PG_MASK) {
+        phys = cpu_get_phys_page_debug(cs, linear & TARGET_PAGE_MASK);
+        if (phys == -1) {
+            return false;
+        }
+        phys |= linear & ~TARGET_PAGE_MASK;
+    } else {
+        phys = linear;
+    }
+
+    section = memory_region_find(get_system_memory(), phys, 1);
+    in_rom = (section.mr == mcpx);
+    if (section.mr != NULL) {
+        memory_region_unref(section.mr);
+    }
+    return in_rom;
+}
+
+/*
+ * Hide the boot ROM (LPC config 0x80 bit 1).
+ *
+ * The MCPX 1.0 ROM turns the cache on before it decrypts the 2BL: it sets
+ * the MTRR default type to write-back and clears CR0.CD/NW. Its bad-2BL
+ * panic then does `ljmp 8:FFFFFFFA`, whose descriptor fetch caches the GDT
+ * at FFFFFFD8, and ends with `out dx, al` at FFFFFFFF, the last byte of the
+ * ROM. A Pentium III wraps EIP to 0 after it and keeps going.
+ *
+ * That is the Visor hack: the xcodes plant a far jump at RAM 0 that reloads
+ * CS through the GDT at FFFFFFD8. The ROM is hidden by then, but on hardware
+ * that read hits the cache line the panic left behind, so the jump lands in
+ * flash. The cache keeps serving the ROM's lines until the flash code
+ * flushes them, which every payload does before it reprograms the MTRRs.
+ *
+ * Model the cache: a hide issued from inside the ROM leaves the overlay
+ * readable until the CPU executes WBINVD or INVD. A hide issued from RAM
+ * (the 2BL) takes effect at once.
+ */
+static void xbox_lpc_hide_mcpx_rom(XBOX_LPCState *s)
+{
+    if (xbox_lpc_cpu_in_mcpx_rom(s)) {
+        XBOXPCI_DPRINTF("BOOT ROM HIDDEN FROM ITSELF, KEEPING CACHED COPY\n");
+        s->mcpx_rom_cached = true;
+        return;
+    }
+
+    XBOXPCI_DPRINTF("DEACTIVATING BOOT ROM\n");
+    s->mcpx_rom_cached = false;
+    xbox_lpc_enable_mcpx_rom(s, false);
+}
+
+void xbox_cpu_cache_flushed(void)
+{
+    XBOX_LPCState *s = xbox_lpc;
+
+    if (s != NULL && s->mcpx_rom_cached) {
+        XBOXPCI_DPRINTF("CACHE FLUSHED, DEACTIVATING BOOT ROM\n");
+        s->mcpx_rom_cached = false;
+        xbox_lpc_enable_mcpx_rom(s, false);
     }
 }
 
 static void xbox_lpc_reset(DeviceState *dev)
 {
+    XBOX_LPCState *s = XBOX_LPC_DEVICE(dev);
+
     XBOXPCI_DPRINTF("ACTIVATING BOOT ROM\n");
-    xbox_lpc_enable_mcpx_rom(PCI_DEVICE(dev), true);
+    s->mcpx_rom_cached = false;
+    xbox_lpc_enable_mcpx_rom(s, true);
 }
 
 static void xbox_lpc_reset_hold(Object *obj, ResetType type)
@@ -358,8 +504,7 @@ static void xbox_lpc_config_write(PCIDevice *dev,
     pci_default_write_config(dev, addr, val, len);
 
     if ((addr == 0x80) && (val & 2)) {
-        XBOXPCI_DPRINTF("DEACTIVATING BOOT ROM\n");
-        xbox_lpc_enable_mcpx_rom(dev, false);
+        xbox_lpc_hide_mcpx_rom(XBOX_LPC_DEVICE(dev));
     }
 
     XBOXPCI_DPRINTF("%s: %x %x %d\n", __func__, addr, val, len);

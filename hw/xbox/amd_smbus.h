@@ -28,7 +28,9 @@
 typedef struct AMD756SMBus {
     I2CBus *smbus;
 
-    uint8_t smb_stat;
+    /* MCPX status is a 16-bit register: bit 11 is the busy/event flag
+     * Cromwell/PrometheOS poll with `in ax, dx` / `test ah, 8`. */
+    uint16_t smb_stat;
     uint8_t smb_ctl;
     uint8_t smb_cmd;
     uint8_t smb_addr;

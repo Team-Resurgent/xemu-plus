@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "trace.h"
 #include "hw/hw.h"
 #include "hw/net/mii.h"
@@ -820,7 +821,28 @@ static void nvnet_mmio_write(void *opaque, hwaddr addr, uint64_t val,
     NvNetState *s = NVNET(opaque);
 
     trace_nvnet_reg_write(addr, get_reg_name(addr), size, val);
-    assert((addr & 3) == 0 && "Unaligned MMIO write");
+
+    /* Registers are dwords. Fold a byte or word store, aligned or not, into
+     * its dword and handle that (the SmartXX OS pokes the MAC address a byte
+     * at a time). A store straddling two dwords is not something the guest
+     * has been seen to do; clip it. */
+    if ((addr & 3) != 0 || size != 4) {
+        hwaddr aligned = addr & ~(hwaddr)3;
+        unsigned shift = (addr & 3) * 8;
+        unsigned bytes = MIN(size, 4 - (addr & 3));
+        uint32_t mask = (bytes >= 4 ? 0xffffffffu : ((1u << (bytes * 8)) - 1))
+                        << shift;
+        uint32_t merged = (get_reg(s, aligned) & ~mask) |
+                          (((uint32_t)val << shift) & mask);
+
+        if (bytes != size) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "nvnet: MMIO write of %u bytes at 0x%" HWADDR_PRIx
+                          " straddles a dword, clipped\n", size, addr);
+        }
+        nvnet_mmio_write(opaque, aligned, merged, 4);
+        return;
+    }
 
     switch (addr) {
     case NVNET_MDIO_ADDR:
@@ -969,6 +991,11 @@ static void nvnet_reset(void *opaque)
 
     memset(&s->regs, 0, sizeof(s->regs));
     or_reg(s, NVNET_TX_RX_CONTROL, NVNET_TX_RX_CONTROL_IDLE);
+    /* The MII clock divider must reset non-zero: the SmartXX OS derives its
+     * MDIO poll timeout from it and never programs it, so a zero here makes
+     * every PHY access after its NIC init fail before it polls. Use what
+     * forcedeth programs. */
+    set_reg(s, NVNET_MII_SPEED, NVNET_MII_SPEED_BIT8 | NVNET_MII_SPEED_DELAY);
 
     reset_phy_regs(s);
     memset(&s->tx_dma_buf, 0, sizeof(s->tx_dma_buf));

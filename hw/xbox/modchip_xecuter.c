@@ -39,6 +39,9 @@
 #include "qemu/timer.h"
 #include "qemu/notify.h"
 
+/* smbus_xbox_smc.c: was the reset in progress requested as a warm reset? */
+bool xbox_smc_take_warm_reset(void);
+
 /* I/O register block, matching ModXover's MODXO_REGISTER_X3_* */
 #define XECUTER_REGISTER_BASE     0xF500
 #define XECUTER_REGISTER_SIZE     16
@@ -715,6 +718,19 @@ static void xecuter_load_tsop(XecuterState *s)
     g_free(filename);
 }
 
+/* Bank selection survives a warm reset (that is how a slot is booted); a
+ * power cycle, or a reset from the host UI, returns to the power-on state. */
+static void xecuter_reset(DeviceState *dev)
+{
+    XecuterState *s = XECUTER_DEVICE(dev);
+
+    if (!xbox_smc_take_warm_reset()) {
+        s->status = 0x00;
+        s->control = 0x0F;
+    }
+    s->flash_state = XECUTER_FLASH_IDLE;
+}
+
 static void xecuter_realize(DeviceState *dev, Error **errp)
 {
     XecuterState *s = XECUTER_DEVICE(dev);
@@ -842,6 +858,7 @@ static void xecuter_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = xecuter_realize;
+    device_class_set_legacy_reset(dc, xecuter_reset);
     dc->vmsd = &vmstate_xecuter;
     device_class_set_props(dc, xecuter_properties);
 }

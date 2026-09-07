@@ -369,13 +369,13 @@ sys:
   # Modchip to emulate. Each modchip is loaded with the modchip BIOS below.
   modchip:
     type: enum
-    values: [none, xenium, xecuter]
+    values: [none, xenium, xecuter, smartxx_opx_2mb, smartxx_4mb]
     default: none
   # Character LCD wired to the modchip's display port. Shown in the LCD window
   # under the Debug menu.
   lcd:
     type: enum
-    values: [none, xecuter]
+    values: [none, xecuter, smartxx]
     default: none
   # Xecuter only: value of the four bank-select switches, which choose the
   # active bank until the guest enables soft control.

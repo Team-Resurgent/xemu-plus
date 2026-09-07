@@ -34,6 +34,9 @@
 #include "qemu/timer.h"
 #include "qemu/notify.h"
 
+/* smbus_xbox_smc.c: was the reset in progress requested as a warm reset? */
+bool xbox_smc_take_warm_reset(void);
+
 #define XENIUM_REGISTER_BASE 0xEE
 #define XENIUM_REGISTER0 0
 #define XENIUM_REGISTER1 1
@@ -580,6 +583,21 @@ static const MemoryRegionOps xenium_flash_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* The bank register survives a warm reset (that is how a slot is booted);
+ * a power cycle, or a reset from the host UI, comes up on the bootloader. */
+static void xenium_reset(DeviceState *dev)
+{
+    XeniumState *s = XENIUM_DEVICE(dev);
+
+    if (!xbox_smc_take_warm_reset()) {
+        s->bank_control = 1;
+        s->recovery = 1;
+        s->led = 1;
+    }
+    s->flash_state = XENIUM_MEMORY_STATE_NORMAL;
+    s->flash_cycle = 1;
+}
+
 static void xenium_realize(DeviceState *dev, Error **errp)
 {
     XeniumState *s = XENIUM_DEVICE(dev);
@@ -693,6 +711,7 @@ static void xenium_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = xenium_realize;
+    device_class_set_legacy_reset(dc, xenium_reset);
     dc->vmsd = &vmstate_xenium;
     device_class_set_props(dc, xenium_properties);
 }
