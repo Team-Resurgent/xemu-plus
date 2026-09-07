@@ -95,4 +95,4 @@ public:
 };
 
 extern AutoUpdateWindow update_window;
-#endif //_ WIN32
+#endif // _WIN32

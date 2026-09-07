@@ -1,9 +1,15 @@
 *.c.inc         diff=c
 *.h.inc         diff=c
 *.m             diff=objc
-*.py            diff=python
+*.py            diff=python text eol=lf
+*.sh            text eol=lf
 *.rs            diff=rust
 *.rs.inc        diff=rust
 Cargo.lock      diff=toml merge=binary
 
 *.patch         -text -whitespace
+
+# Keep shebang scripts LF so Docker/Linux builds work from a Windows checkout
+build.sh        text eol=lf
+configure       text eol=lf
+scripts/hxtool  text eol=lf

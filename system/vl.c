@@ -3231,11 +3231,16 @@ void qemu_init(int argc, char **argv)
     }
 
     // Always populate DVD drive. If disc path is the empty string, drive is
-    // connected but no media present.
+    // connected but no media present. A directory is served as a virtual XISO.
     fake_argv[fake_argc++] = strdup("-drive");
     char *escaped_dvd_path = strdup_double_commas(dvd_path);
-    fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
-        escaped_dvd_path);
+    if (dvd_path[0] && g_file_test(dvd_path, G_FILE_TEST_IS_DIR)) {
+        fake_argv[fake_argc++] = g_strdup_printf(
+            "index=1,media=cdrom,file=%s,driver=xdvdfs", escaped_dvd_path);
+    } else {
+        fake_argv[fake_argc++] = g_strdup_printf("index=1,media=cdrom,file=%s",
+            escaped_dvd_path);
+    }
     free(escaped_dvd_path);
 
     fake_argv[fake_argc++] = strdup("-display");

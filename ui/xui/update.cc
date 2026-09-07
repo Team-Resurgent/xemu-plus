@@ -29,17 +29,26 @@
 
 using json = nlohmann::json;
 
-const char *releases_url = "https://api.github.com/repos/xemu-project/xemu/releases/latest";
-
-#if defined(__x86_64__)
-#define PACKAGE_ARCH "x86_64"
-#elif defined(__aarch64__)
-#define PACKAGE_ARCH "arm64"
-#else
-#error Unhandled package arch
-#endif
+/* This fork must not poll xemu-project/xemu: that latest tag is a different
+ * product, so the Windows updater would keep offering official builds. */
+const char *releases_url =
+    "https://api.github.com/repos/Team-Resurgent/ResEmu-X/releases/latest";
+const char *releases_page_url =
+    "https://github.com/Team-Resurgent/ResEmu-X/releases/latest";
 
 #define DPRINTF(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__);
+
+static std::string version_tag(std::string s)
+{
+    if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) {
+        s.erase(0, 1);
+    }
+    size_t dash = s.find('-');
+    if (dash != std::string::npos) {
+        s.resize(dash);
+    }
+    return s;
+}
 
 AutoUpdateWindow update_window;
 
@@ -178,32 +187,33 @@ void Updater::check_for_update_internal()
 
     try {
         json release = json::parse(std::string((const char *)data->data, data->len));
-        m_release_url = release.value("html_url", "https://github.com/xemu-project/xemu/releases/latest");
+        m_release_url = release.value("html_url", releases_page_url);
         m_release_version = release["tag_name"].get<std::string>();
-        if (!m_release_version.empty() && m_release_version[0] == 'v') {
+        if (!m_release_version.empty() &&
+            (m_release_version[0] == 'v' || m_release_version[0] == 'V')) {
             m_release_version = m_release_version.substr(1);
         }
 
+        /* CI zips are unversioned: xemu-win64.zip. Version is the GitHub tag. */
         m_release_package_url.clear();
-        std::string expected_filename = "xemu-" + m_release_version + "-windows-" PACKAGE_ARCH ".zip";
         for (const auto &asset : release["assets"]) {
-            std::string name = asset["name"].get<std::string>();
-            if (name == expected_filename) {
-                m_release_package_url = asset["browser_download_url"].get<std::string>();
+            if (asset["name"].get<std::string>() == "xemu-win64.zip") {
+                m_release_package_url =
+                    asset["browser_download_url"].get<std::string>();
                 break;
             }
         }
 
         if (m_release_package_url.empty()) {
-            DPRINTF("Could not find asset matching %s\n", expected_filename.c_str());
+            DPRINTF("Could not find xemu-win64.zip in release assets\n");
             m_status = UPDATER_ERROR;
             goto finished;
         }
 
-        if (m_release_version != xemu_version) {
-            m_update_availability = UPDATE_AVAILABLE;
-        } else {
+        if (version_tag(m_release_version) == version_tag(xemu_version)) {
             m_update_availability = UPDATE_NOT_AVAILABLE;
+        } else {
+            m_update_availability = UPDATE_AVAILABLE;
         }
     } catch (const json::exception &e) {
         DPRINTF("JSON parse error: %s\n", e.what());

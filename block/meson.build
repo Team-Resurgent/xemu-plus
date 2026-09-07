@@ -47,6 +47,10 @@ block_ss.add(files(
 libcci = subproject('libcci')
 block_ss.add(files('cci.c'), libcci.get_variable('libcci_dep'))
 
+# Virtual XISO from a host directory. Layout/read lives in libxdvdfs/;
+# block/xdvdfs.c is a thin QEMU adapter.
+block_ss.add(files('xdvdfs.c'), libxdvdfs_dep)
+
 system_ss.add(when: 'CONFIG_TCG', if_true: files('blkreplay.c'))
 system_ss.add(files('block-ram-registrar.c'))
 

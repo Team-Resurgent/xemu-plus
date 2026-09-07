@@ -453,6 +453,10 @@ public:
             ActionLoadDisc();
             pop = true;
         }
+        if (PopupMenuButton("Load Folder...", ICON_FA_FOLDER_OPEN)) {
+            ActionLoadFolder();
+            pop = true;
+        }
         if (PopupMenuSubmenuButton("Settings", ICON_FA_GEARS)) {
             nav.PushFocus();
             nav.PushMenu(settings);

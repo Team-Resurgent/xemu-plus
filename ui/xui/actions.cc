@@ -50,6 +50,17 @@ void ActionLoadDisc(void)
     });
 }
 
+void ActionLoadFolder(void)
+{
+    const char *default_path = g_config.sys.files.dvd_path;
+    if (!default_path || !default_path[0]) {
+        default_path = g_config.general.games_dir;
+    }
+    ShowOpenFolderDialog(default_path, [](const char *path) {
+        ActionLoadDiscFile(path);
+    });
+}
+
 void ActionLoadDiscFile(const char *file_path)
 {
     Error *err = NULL;

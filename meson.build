@@ -4031,6 +4031,7 @@ if have_block
 
   subdir('nbd')
   subdir('scsi')
+  subdir('libxdvdfs')
   subdir('block')
 
   blockdev_ss.add(files(
